@@ -134,9 +134,16 @@
   // Groups short recognised chunks into one line once the speaker pauses.
   function addFinal(text, ms) {
     if (text === lastChunk) return;          // browser re-sent the same chunk
-    lastChunk = text;
+    const t = text.toLowerCase(), l = lastChunk.toLowerCase();
+    if (l && l.startsWith(t)) return;        // shorter repeat of what we already have
     if (!pendingText) pendingTime = timeStr(ms);
-    pendingText = pendingText ? pendingText + ' ' + text : text;
+    if (l && t.startsWith(l) && pendingText.endsWith(lastChunk)) {
+      // Android sends growing versions of one phrase: replace, don't append.
+      pendingText = pendingText.slice(0, pendingText.length - lastChunk.length) + text;
+    } else {
+      pendingText = pendingText ? pendingText + ' ' + text : text;
+    }
+    lastChunk = text;
     clearTimeout(flushTimer);
     if (pendingText.length > MAX_CHARS) flush();
     else flushTimer = setTimeout(flush, SENTENCE_PAUSE_MS);
