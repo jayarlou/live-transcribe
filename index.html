@@ -90,6 +90,7 @@
   <footer>
     Uses your browser's built-in speech recognition. Chrome and Edge send audio to a cloud speech service,
     so avoid using this for confidential conversations. Accuracy depends on the browser, microphone and language.
+    The browser can only listen for one language at a time, so pick the language you are speaking.
   </footer>
 </main>
 
@@ -100,11 +101,21 @@
   const toggleBtn = $('toggle'), langSel = $('lang'), out = $('transcript');
   const dot = $('dot'), statusText = $('statusText'), notice = $('notice');
 
-  let recognition = null;      // the active SpeechRecognition instance
-  let listening = false;       // user intent: should we be listening?
-  let finalLines = [];         // [{ time, text }]
-  let interimText = '';
+  const SENTENCE_PAUSE_MS = 2000;   // silence that ends a sentence
+  const MAX_CHARS = 240;            // force a line break for very long runs
+
+  let recognition = null;           // the active SpeechRecognition instance
+  let listening = false;            // user intent: should we be listening?
   let sessionStart = 0;
+  let sessionId = 0;
+
+  let finalLines = [];              // committed lines: [{ time, text }]
+  let pendingText = '';             // recognised speech not yet grouped into a line
+  let pendingTime = '';
+  let lastChunk = '';               // guards against the browser repeating the same final
+  let flushTimer = null;
+  let interimText = '';
+  const seenKeys = new Set();       // "session:resultIndex" of finals already handled
 
   function timeStr(ms) {
     const s = Math.floor(ms / 1000);
@@ -120,35 +131,55 @@
     statusText.textContent = on ? 'Listening (' + langSel.value + ')' : 'Stopped';
   }
 
+  // Groups short recognised chunks into one line once the speaker pauses.
+  function addFinal(text, ms) {
+    if (text === lastChunk) return;          // browser re-sent the same chunk
+    lastChunk = text;
+    if (!pendingText) pendingTime = timeStr(ms);
+    pendingText = pendingText ? pendingText + ' ' + text : text;
+    clearTimeout(flushTimer);
+    if (pendingText.length > MAX_CHARS) flush();
+    else flushTimer = setTimeout(flush, SENTENCE_PAUSE_MS);
+  }
+
+  function flush() {
+    clearTimeout(flushTimer);
+    if (!pendingText) return;
+    finalLines.push({ time: pendingTime, text: pendingText });
+    pendingText = '';
+    render();
+  }
+
   function render() {
     out.textContent = '';
-    if (!finalLines.length && !interimText) {
+    if (!finalLines.length && !pendingText && !interimText) {
       const p = document.createElement('p');
       p.className = 'empty';
       p.textContent = 'Press Start and speak. Words will appear here as you talk.';
       out.append(p);
       return;
     }
-    for (const line of finalLines) {
+    const addLine = (time, text, cls) => {
       const p = document.createElement('p');
-      p.className = 'line';
-      const t = document.createElement('span');
-      t.className = 'time';
-      t.textContent = line.time;
-      p.append(t, document.createTextNode(line.text));
+      p.className = cls;
+      if (time) {
+        const t = document.createElement('span');
+        t.className = 'time';
+        t.textContent = time;
+        p.append(t);
+      }
+      p.append(document.createTextNode(text));
       out.append(p);
-    }
-    if (interimText) {
-      const p = document.createElement('p');
-      p.className = 'line interim';
-      p.textContent = interimText;
-      out.append(p);
-    }
+    };
+    for (const line of finalLines) addLine(line.time, line.text, 'line');
+    if (pendingText) addLine(pendingTime, pendingText, 'line');
+    if (interimText) addLine('', interimText, 'line interim');
     out.scrollTop = out.scrollHeight;
   }
 
   function startListening() {
     const rec = new SR();
+    const id = ++sessionId;
     rec.lang = langSel.value;
     rec.continuous = true;
     rec.interimResults = true;
@@ -160,7 +191,11 @@
         const r = e.results[i];
         const text = r[0].transcript.trim();
         if (r.isFinal) {
-          if (text) finalLines.push({ time: timeStr(Date.now() - sessionStart), text });
+          const key = id + ':' + i;
+          if (text && !seenKeys.has(key)) {
+            seenKeys.add(key);
+            addFinal(text, Date.now() - sessionStart);
+          }
         } else {
           interim += text + ' ';
         }
@@ -209,6 +244,7 @@
     listening = false;
     interimText = '';
     if (recognition) recognition.stop();
+    flush();
     render();
     setUI(false);
   }
@@ -221,12 +257,14 @@
     const old = recognition;
     recognition = null;
     interimText = '';
+    flush();
     if (old) old.abort();
     startListening();
     setUI(true);
   });
 
   $('copy').addEventListener('click', async () => {
+    flush();
     const text = finalLines.map((l) => `[${l.time}] ${l.text}`).join('\n');
     if (!text) return;
     try {
@@ -238,6 +276,7 @@
   });
 
   $('download').addEventListener('click', () => {
+    flush();
     const body = finalLines.map((l) => `[${l.time}] ${l.text}`).join('\n');
     if (!body) return;
     const stamp = new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-');
@@ -249,9 +288,13 @@
   });
 
   $('clear').addEventListener('click', () => {
-    if (!finalLines.length && !interimText) return;
+    if (!finalLines.length && !pendingText && !interimText) return;
     if (!confirm('Clear the transcript?')) return;
+    clearTimeout(flushTimer);
     finalLines = [];
+    pendingText = '';
+    pendingTime = '';
+    lastChunk = '';
     interimText = '';
     sessionStart = listening ? Date.now() : 0;
     render();
