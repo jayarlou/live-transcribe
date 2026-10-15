@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Live Transcribe</title>
+<style>
+  :root {
+    --bg: #f6f6f4; --panel: #ffffff; --text: #1c1c1a; --muted: #6b6b66;
+    --accent: #2563eb; --danger: #dc2626; --border: #e2e2dc;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #121214; --panel: #1d1d21; --text: #ececec; --muted: #9a9aa3;
+      --accent: #60a5fa; --danger: #f87171; --border: #2c2c32;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg); color: var(--text);
+  }
+  header {
+    position: sticky; top: 0; z-index: 1;
+    display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between;
+    padding: 14px 20px; background: var(--panel); border-bottom: 1px solid var(--border);
+  }
+  h1 { font-size: 18px; margin: 0; }
+  .controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  select, button {
+    font: inherit; font-size: 14px; padding: 8px 14px; border-radius: 8px;
+    border: 1px solid var(--border); background: var(--panel); color: var(--text); cursor: pointer;
+  }
+  button.primary { background: var(--accent); color: #fff; border-color: transparent; min-width: 110px; }
+  button.stop { background: var(--danger); color: #fff; border-color: transparent; min-width: 110px; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  .status { font-size: 13px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .dot.live { background: var(--danger); animation: pulse 1.2s infinite; }
+  @keyframes pulse { 50% { opacity: .3; } }
+  main { max-width: 860px; margin: 0 auto; padding: 20px; }
+  #transcript {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 20px; min-height: 360px; max-height: 65vh; overflow-y: auto;
+    line-height: 1.6; font-size: 18px;
+  }
+  .line { margin: 0 0 10px; }
+  .time { color: var(--muted); font-size: 12px; margin-right: 10px; font-variant-numeric: tabular-nums; }
+  .interim { color: var(--muted); font-style: italic; }
+  .empty { color: var(--muted); margin: 0; }
+  .actions { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+  .notice { margin-top: 12px; color: var(--danger); font-size: 14px; min-height: 1em; }
+  footer { margin-top: 14px; font-size: 12px; color: var(--muted); line-height: 1.5; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Live Transcribe</h1>
+  <div class="controls">
+    <select id="lang" aria-label="Spoken language">
+      <option value="en-NZ">English (NZ)</option>
+      <option value="en-AU">English (AU)</option>
+      <option value="en-US">English (US)</option>
+      <option value="en-GB">English (UK)</option>
+      <option value="fil-PH">Filipino</option>
+      <option value="es-ES">Spanish</option>
+      <option value="fr-FR">French</option>
+      <option value="de-DE">German</option>
+      <option value="it-IT">Italian</option>
+      <option value="pt-BR">Portuguese (BR)</option>
+      <option value="hi-IN">Hindi</option>
+      <option value="ja-JP">Japanese</option>
+      <option value="ko-KR">Korean</option>
+      <option value="zh-CN">Chinese (Mandarin)</option>
+      <option value="ar-SA">Arabic</option>
+    </select>
+    <button id="toggle" class="primary">Start</button>
+  </div>
+  <div class="status"><span id="dot" class="dot"></span><span id="statusText">Ready</span></div>
+</header>
+
+<main>
+  <div id="transcript" aria-live="polite"></div>
+  <div class="actions">
+    <button id="copy">Copy</button>
+    <button id="download">Download .txt</button>
+    <button id="clear">Clear</button>
+  </div>
+  <div id="notice" class="notice"></div>
+  <footer>
+    Uses your browser's built-in speech recognition. Chrome and Edge send audio to a cloud speech service,
+    so avoid using this for confidential conversations. Accuracy depends on the browser, microphone and language.
+  </footer>
+</main>
+
+<script>
+(() => {
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  const $ = (id) => document.getElementById(id);
+  const toggleBtn = $('toggle'), langSel = $('lang'), out = $('transcript');
+  const dot = $('dot'), statusText = $('statusText'), notice = $('notice');
+
+  let recognition = null;      // the active SpeechRecognition instance
+  let listening = false;       // user intent: should we be listening?
+  let finalLines = [];         // [{ time, text }]
+  let interimText = '';
+  let sessionStart = 0;
+
+  function timeStr(ms) {
+    const s = Math.floor(ms / 1000);
+    return String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0');
+  }
+
+  function showNotice(msg) { notice.textContent = msg; }
+
+  function setUI(on) {
+    toggleBtn.textContent = on ? 'Stop' : 'Start';
+    toggleBtn.className = on ? 'stop' : 'primary';
+    dot.className = on ? 'dot live' : 'dot';
+    statusText.textContent = on ? 'Listening (' + langSel.value + ')' : 'Stopped';
+  }
+
+  function render() {
+    out.textContent = '';
+    if (!finalLines.length && !interimText) {
+      const p = document.createElement('p');
+      p.className = 'empty';
+      p.textContent = 'Press Start and speak. Words will appear here as you talk.';
+      out.append(p);
+      return;
+    }
+    for (const line of finalLines) {
+      const p = document.createElement('p');
+      p.className = 'line';
+      const t = document.createElement('span');
+      t.className = 'time';
+      t.textContent = line.time;
+      p.append(t, document.createTextNode(line.text));
+      out.append(p);
+    }
+    if (interimText) {
+      const p = document.createElement('p');
+      p.className = 'line interim';
+      p.textContent = interimText;
+      out.append(p);
+    }
+    out.scrollTop = out.scrollHeight;
+  }
+
+  function startListening() {
+    const rec = new SR();
+    rec.lang = langSel.value;
+    rec.continuous = true;
+    rec.interimResults = true;
+
+    rec.onresult = (e) => {
+      if (rec !== recognition) return;
+      let interim = '';
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        const r = e.results[i];
+        const text = r[0].transcript.trim();
+        if (r.isFinal) {
+          if (text) finalLines.push({ time: timeStr(Date.now() - sessionStart), text });
+        } else {
+          interim += text + ' ';
+        }
+      }
+      interimText = interim.trim();
+      render();
+    };
+
+    rec.onerror = (e) => {
+      if (rec !== recognition) return;
+      if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
+        showNotice('Microphone access was blocked. Allow it in your browser settings and try again.');
+        stop();
+      } else if (e.error !== 'no-speech' && e.error !== 'aborted') {
+        showNotice('Speech recognition error: ' + e.error);
+      }
+    };
+
+    rec.onend = () => {
+      if (rec !== recognition) return;
+      if (listening) {
+        // Browsers end the session after a pause; restart it so listening continues.
+        try { rec.start(); } catch (err) { stop(); }
+      } else {
+        setUI(false);
+      }
+    };
+
+    recognition = rec;
+    rec.start();
+  }
+
+  function start() {
+    if (!SR) {
+      showNotice('This browser does not support live speech recognition. Try Chrome, Edge or Safari.');
+      return;
+    }
+    showNotice('');
+    if (!sessionStart) sessionStart = Date.now();
+    listening = true;
+    startListening();
+    setUI(true);
+  }
+
+  function stop() {
+    listening = false;
+    interimText = '';
+    if (recognition) recognition.stop();
+    render();
+    setUI(false);
+  }
+
+  toggleBtn.addEventListener('click', () => (listening ? stop() : start()));
+
+  langSel.addEventListener('change', () => {
+    if (!listening) { setUI(false); return; }
+    // Restart with the new language; ignore events from the old session.
+    const old = recognition;
+    recognition = null;
+    interimText = '';
+    if (old) old.abort();
+    startListening();
+    setUI(true);
+  });
+
+  $('copy').addEventListener('click', async () => {
+    const text = finalLines.map((l) => `[${l.time}] ${l.text}`).join('\n');
+    if (!text) return;
+    try {
+      await navigator.clipboard.writeText(text);
+      showNotice('Copied to clipboard.');
+    } catch {
+      showNotice('Could not access the clipboard.');
+    }
+  });
+
+  $('download').addEventListener('click', () => {
+    const body = finalLines.map((l) => `[${l.time}] ${l.text}`).join('\n');
+    if (!body) return;
+    const stamp = new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-');
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([body + '\n'], { type: 'text/plain' }));
+    a.download = `transcript-${stamp}.txt`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  });
+
+  $('clear').addEventListener('click', () => {
+    if (!finalLines.length && !interimText) return;
+    if (!confirm('Clear the transcript?')) return;
+    finalLines = [];
+    interimText = '';
+    sessionStart = listening ? Date.now() : 0;
+    render();
+  });
+
+  if (!SR) {
+    toggleBtn.disabled = true;
+    showNotice('This browser does not support live speech recognition. Try Chrome, Edge or Safari.');
+  }
+  setUI(false);
+  render();
+})();
+</script>
+</body>
+</html>
